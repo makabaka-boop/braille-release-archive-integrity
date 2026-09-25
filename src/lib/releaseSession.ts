@@ -10,7 +10,13 @@
  */
 import { effectScope, ref, watch, type Ref } from 'vue';
 import type { ReleaseSlip } from './release';
-import { appendReleaseSlip, loadReleaseState, writeFailureWarning, type StoredReleases } from './releaseStorage';
+import {
+  appendReleaseSlip,
+  idConflictWarning,
+  loadReleaseState,
+  writeFailureWarning,
+  type StoredReleases
+} from './releaseStorage';
 import { useDraftSession } from './draftSession';
 import { useCalibrationSession } from './calibrationSession';
 
@@ -55,15 +61,38 @@ export function useReleaseSession(): ReleaseSession {
     }
 
     function issue(slip: ReleaseSlip): IssueOutcome {
-      const saved = appendReleaseSlip(slip);
-      if (!saved) {
-        reloadArchive();
-        return { ok: false, error: writeFailureWarning().message };
-      }
+      const result = appendReleaseSlip(slip);
+      // 任何结果都先重新装载存档：成功可展示新历史，失败也让保护态 /
+      // 编号冲突 / 交错写入的最新状态立即反映到界面。
       reloadArchive();
-      invalidatedSlip.value = null;
-      activeSlip.value = slip;
-      return { ok: true, error: null };
+      switch (result.outcome) {
+        case 'appended':
+          invalidatedSlip.value = null;
+          activeSlip.value = slip;
+          return { ok: true, error: null };
+        case 'duplicate':
+          // 同编号同内容的重复签发幂等：当前展示的单据必须就是历史中那份原件。
+          invalidatedSlip.value = null;
+          activeSlip.value = result.existing;
+          return { ok: true, error: null };
+        case 'id-conflict':
+          // 同编号但内容不同：明确拒绝。绝不把提交件冒充成已存档原件，
+          // 也不设为当前授权；历史原件保留，界面据存档复核。
+          activeSlip.value = null;
+          return { ok: false, error: idConflictWarning().message };
+        case 'write-failed':
+          activeSlip.value = null;
+          return { ok: false, error: writeFailureWarning().message };
+        case 'protected':
+          activeSlip.value = null;
+          return { ok: false, error: result.error };
+        case 'invalid-slip':
+          activeSlip.value = null;
+          return {
+            ok: false,
+            error: '放行单内容无法通过领域复核，本次签发未写入：历史放行单与原存档仍保留。'
+          };
+      }
     }
 
     // 闸门依据的任何变化都让当前授权立即失效（历史单据不受影响）。

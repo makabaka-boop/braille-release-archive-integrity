@@ -296,6 +296,57 @@ describe('ReleaseWorkspace 合格签发、失效与只读复核', () => {
     second.unmount();
   });
 
+  it('受控相同编号但内容不同：明确报编号冲突，不设当前授权，历史原件保留可复核', async () => {
+    // 先正常签发一张（内容“一二三”），占用编号
+    await preparePass('一二三', '4');
+    const mounted = mountRelease();
+    await tick();
+    ($('[data-testid="release-issue"]') as HTMLButtonElement).click();
+    await tick();
+    const active = $('[data-testid="release-active"]') as Element;
+    const occupiedId = active.querySelector('[data-testid="slip-id"]')?.textContent?.replace('放行单号：', '') ?? '';
+    const parsed = /^PF-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-([0-9a-f]{8})$/.exec(occupiedId);
+    expect(parsed).not.toBeNull();
+
+    // 把单稿改成不同内容；冻结时间戳与随机后缀，使下一张得到相同编号。
+    // 编号格式化使用本地时区，需把目标挂钟时刻按本地偏移换算成 UTC 冻结点。
+    const { draft } = sessions();
+    draft.text.value = '四五六';
+    await tick(2);
+
+    const wallClockUtc = Date.parse(
+      `${parsed![1]}-${parsed![2]}-${parsed![3]}T${parsed![4]}:${parsed![5]}:${parsed![6]}Z`
+    );
+    const wallClock = new Date(wallClockUtc);
+    const frozen = new Date(wallClock.getTime() + wallClock.getTimezoneOffset() * 60000);
+    const suffixValue = parseInt(parsed![7], 16);
+    vi.useFakeTimers({ now: frozen });
+    vi.spyOn(Math, 'random').mockReturnValue((suffixValue + 0.5) / 0xffffffff);
+    const pad = (v: number) => String(v).padStart(2, '0');
+    const expectedId =
+      `PF-${frozen.getFullYear()}${pad(frozen.getMonth() + 1)}${pad(frozen.getDate())}` +
+      `-${pad(frozen.getHours())}${pad(frozen.getMinutes())}${pad(frozen.getSeconds())}-${parsed![7]}`;
+    expect(expectedId).toBe(occupiedId);
+
+    ($('[data-testid="release-issue"]') as HTMLButtonElement).click();
+    await tick(2);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+
+    // 明确的编号冲突告警
+    expect($('[data-testid="release-write-error"]')?.textContent).toContain('编号冲突');
+    // 不冒充为当前授权
+    expect($('[data-testid="release-active"]')).toBeNull();
+    // 历史仍只有占用编号的原件，且内容是“一二三”而非当前草稿“四五六”
+    const items = document.querySelectorAll('[data-testid="release-history-item"]');
+    expect(items).toHaveLength(1);
+    expect(items[0].querySelector('[data-testid="slip-draft-text"]')?.textContent).toContain('一二三');
+
+    // 当前可放行的草稿内容与历史原件明确不同，复核以历史原件为准
+    expect($('[data-testid="gate-draft-text"]')?.textContent).toContain('四五六');
+    mounted.unmount();
+  });
+
   it('放行单写入失败：明确告警、原存档保留、不产生伪签发', async () => {
     await preparePass();
     const mounted = mountRelease();

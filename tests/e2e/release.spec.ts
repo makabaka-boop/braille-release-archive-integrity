@@ -386,6 +386,233 @@ test.describe('压点放行：失败保护', () => {
   });
 });
 
+test.describe('压点放行：历史完整性（数量 / 交错 / 编号冲突）', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/');
+  });
+
+  test('累计超过 200 次签发后历史一份不丢，每份内容一致，当前放行单与历史最新件一致', async ({ page }) => {
+    await fillDraft(page, '12，三。', '4');
+    await judgePass(page);
+    await page.getByTestId('mode-release').click();
+    await expect(page.getByTestId('release-issue')).toBeEnabled();
+
+    // 连续签发 205 张（点击处理同步完成，签发后单稿 / 校准未变，授权持续有效）。
+    // 注入确定性随机源，避免 8 位随机后缀的生日碰撞让测试偶发；时间戳也逐秒不同。
+    await page.evaluate(() => {
+      let counter = 0;
+      const realRandom = Math.random;
+      const holder = window as unknown as { __restoreRandomForReleaseTest?: () => void };
+      Math.random = () => {
+        counter += 1;
+        return counter / 0x100000000;
+      };
+      holder.__restoreRandomForReleaseTest = () => {
+        Math.random = realRandom;
+      };
+      const button = document.querySelector<HTMLButtonElement>('[data-testid="release-issue"]');
+      for (let i = 0; i < 205; i += 1) {
+        button?.click();
+      }
+    });
+
+    // 当前授权仍在，且就是历史最新一张。205 张卡片的同步签发 + 渲染耗时较长，
+    // 这里放宽等待上限（数据本身在签发循环结束时已全部落盘）。
+    await expect(page.getByTestId('release-active')).toBeVisible({ timeout: 30_000 });
+    const activeId = (await page.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+
+    // 历史数量：205 张全部可查（旧实现会在第 201 张静默丢最早一张）
+    await expect(page.getByTestId('release-history-item')).toHaveCount(205, { timeout: 30_000 });
+    await expect(page.getByRole('heading', { name: /历史放行单/ })).toContainText('205 份', { timeout: 30_000 });
+
+    const summary = await page.evaluate(
+      ([key, expectedActive]) => {
+        const record = JSON.parse(window.localStorage.getItem(key) ?? '{}');
+        const slips = record.slips as Array<{
+          id: string;
+          issuedAt: string;
+          snapshot: { draft: { text: string; width: number; totalCells: number } };
+        }>;
+        const ids = slips.map((s) => s.id);
+        const latest = slips[slips.length - 1];
+        return {
+          version: record.version,
+          count: slips.length,
+          uniqueIds: new Set(ids).size,
+          firstId: slips[0].id,
+          latestId: latest.id,
+          allContentConsistent: slips.every(
+            (s) => s.snapshot.draft.text === '12，三。' && s.snapshot.draft.width === 4 && s.snapshot.draft.totalCells === 6
+          ),
+          activeIsLatest: `放行单号：${latest.id}` === expectedActive
+        };
+      },
+      [RELEASE_KEY, activeId] as [string, string]
+    );
+
+    expect(summary.version).toBe(1);
+    expect(summary.count).toBe(205);
+    expect(summary.uniqueIds).toBe(205);
+    expect(summary.allContentConsistent).toBe(true);
+    expect(summary.activeIsLatest).toBe(true);
+
+    // 最早一张在刷新后仍能按编号定位并只读复核（旧实现此时已静默消失）
+    await page.evaluate(() => {
+      (window as unknown as { __restoreRandomForReleaseTest?: () => void }).__restoreRandomForReleaseTest?.();
+    });
+    await page.reload();
+    await page.getByTestId('mode-release').click();
+    const oldest = page.getByTestId('release-history-item').last();
+    await expect(oldest).toHaveAttribute('data-slip-id', summary.firstId);
+    await expect(oldest.getByTestId('slip-draft-text')).toContainText('12，三。');
+    await expect(page.getByTestId('release-history-item')).toHaveCount(205);
+  });
+
+  test('双页签交错签发：后写入不覆盖先写入，两页签历史齐全且当前授权各自独立', async ({ page, context }) => {
+    await fillDraft(page, '12，三。', '4');
+    await judgePass(page);
+    await page.getByTestId('mode-release').click();
+
+    const tabA = page;
+    const tabB = await context.newPage();
+    await tabB.goto('/');
+    await tabB.getByTestId('mode-release').click();
+
+    // A 先签发 a1
+    await tabA.getByTestId('release-issue').click();
+    const idA1 = (await tabA.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+    const a1 = idA1.replace('放行单号：', '');
+
+    // B 随后签发 b1（B 的追加必须合并 A 刚写入的 a1，而不是覆盖）
+    await tabB.getByTestId('release-issue').click();
+    const idB1 = (await tabB.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+    const b1 = idB1.replace('放行单号：', '');
+
+    // A 再签发 a2（A 的追加必须合并 B 写入的 b1）
+    await tabA.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key })), RELEASE_KEY);
+    await tabA.getByTestId('release-issue').click();
+    const idA2 = (await tabA.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+    const a2 = idA2.replace('放行单号：', '');
+
+    const expectedOrder = [a1, b1, a2];
+    expect(new Set(expectedOrder).size).toBe(3);
+
+    // 磁盘上的最终历史：三张齐全、顺序为到达顺序、内容互不覆盖
+    const storedIds = await tabA.evaluate((key) => {
+      const record = JSON.parse(window.localStorage.getItem(key) ?? '{}');
+      return (record.slips as Array<{ id: string }>).map((s) => s.id);
+    }, RELEASE_KEY);
+    expect(storedIds).toEqual(expectedOrder);
+
+    // 通知 B 同步最新存档
+    await tabB.evaluate((key) => window.dispatchEvent(new StorageEvent('storage', { key })), RELEASE_KEY);
+
+    // 两个页签都复核得到同样三张，且每张都能在历史中找到
+    for (const tab of [tabA, tabB]) {
+      await expect(tab.getByTestId('release-history-item')).toHaveCount(3);
+      const ids = await tab
+        .getByTestId('release-history-item')
+        .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-slip-id')));
+      expect(ids).toEqual([...expectedOrder].reverse()); // 历史区最新在前
+    }
+
+    // 当前授权各自独立：A 停在 a2，B 仍停在自己签发的 b1（别人的单据只进历史）
+    await expect(tabA.getByTestId('release-active').getByTestId('slip-id')).toContainText(a2);
+    await expect(tabB.getByTestId('release-active').getByTestId('slip-id')).toContainText(b1);
+
+    // 每张单据与其历史复核件内容一致
+    await tabA.getByTestId('release-history-item').first().getByTestId('slip-draft-text');
+    const cards = await tabA.getByTestId('release-history-item').all();
+    for (const card of cards) {
+      await expect(card.getByTestId('slip-draft-text')).toContainText('12，三。');
+      await expect(card.locator('[data-testid="slip-point-row"]')).toHaveCount(6);
+    }
+
+    await tabB.close();
+  });
+
+  test('受控相同编号但内容不同：明确报编号冲突，拒绝伪签发，历史原件保留；恢复后可正常签发', async ({ page }) => {
+    await fillDraft(page, '12，三。', '4');
+    await judgePass(page);
+    await page.getByTestId('mode-release').click();
+    await page.getByTestId('release-issue').click();
+    await expect(page.getByTestId('release-active')).toBeVisible();
+    const occupied = (await page.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+    const occupiedId = occupied.replace('放行单号：', '');
+    const beforeRaw = await page.evaluate((key) => window.localStorage.getItem(key), RELEASE_KEY);
+
+    // 改成不同内容，并冻结时钟 / 随机源，使下一张恰好得到相同编号
+    await page.getByTestId('mode-single').click();
+    await page.getByTestId('phrase-input').fill('一二三');
+    await page.getByTestId('mode-release').click();
+
+    await page.evaluate((id) => {
+      const match = /^PF-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-([0-9a-f]{8})$/.exec(id);
+      if (!match) {
+        throw new Error(`无法解析编号：${id}`);
+      }
+      const [, y, mo, d, h, mi, s, suffixHex] = match;
+      const fixedLocal = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s));
+      const windowWithOverrides = window as unknown as {
+        Date: typeof Date;
+        __restoreReleaseIdSources?: () => void;
+      };
+      const RealDate = windowWithOverrides.Date;
+      class FrozenDate extends RealDate {
+        constructor(...args: unknown[]) {
+          if (args.length === 0) {
+            super(fixedLocal.getTime());
+          } else {
+            super(...(args as [number]));
+          }
+        }
+        static now(): number {
+          return fixedLocal.getTime();
+        }
+      }
+      windowWithOverrides.Date = FrozenDate as unknown as typeof Date;
+      const realRandom = Math.random;
+      const suffixValue = parseInt(suffixHex, 16);
+      Math.random = () => (suffixValue + 0.5) / 0xffffffff;
+      windowWithOverrides.__restoreReleaseIdSources = () => {
+        windowWithOverrides.Date = RealDate;
+        Math.random = realRandom;
+      };
+    }, occupiedId);
+
+    await page.getByTestId('release-issue').click();
+
+    // 明确的编号冲突结果
+    await expect(page.getByTestId('release-write-error')).toContainText('编号冲突');
+    await expect(page.getByTestId('release-active')).toHaveCount(0);
+    // 存档逐字保留，历史中只有占用编号的原件且内容仍是“12，三。”
+    const afterRaw = await page.evaluate((key) => window.localStorage.getItem(key), RELEASE_KEY);
+    expect(afterRaw).toBe(beforeRaw);
+    await expect(page.getByTestId('release-history-item')).toHaveCount(1);
+    const onlyHistory = page.getByTestId('release-history-item').first();
+    await expect(onlyHistory).toHaveAttribute('data-slip-id', occupiedId);
+    await expect(onlyHistory.getByTestId('slip-draft-text')).toContainText('12，三。');
+    // 当前屏幕草稿确实与历史原件不同
+    await expect(page.getByTestId('gate-draft-text')).toContainText('一二三');
+
+    // 恢复时钟 / 随机源后重新签发：成功产生第二张，原件仍在
+    await page.evaluate(() => {
+      (window as unknown as { __restoreReleaseIdSources?: () => void }).__restoreReleaseIdSources?.();
+    });
+    await page.getByTestId('release-issue').click();
+    await expect(page.getByTestId('release-active')).toBeVisible();
+    await expect(page.getByTestId('release-history-item')).toHaveCount(2);
+    const newest = page.getByTestId('release-history-item').first();
+    await expect(newest.getByTestId('slip-draft-text')).toContainText('一二三');
+    const oldest = page.getByTestId('release-history-item').last();
+    await expect(oldest).toHaveAttribute('data-slip-id', occupiedId);
+    await expect(oldest.getByTestId('slip-draft-text')).toContainText('12，三。');
+    // 当前放行单与历史最新件一致
+    const activeId = (await page.getByTestId('release-active').getByTestId('slip-id').textContent()) ?? '';
+    await expect(newest).toHaveAttribute('data-slip-id', activeId.replace('放行单号：', ''));
+  });
+});
+
 test.describe('压点放行：既有模式输入与结论不变', () => {
   test('原单稿预检、双稿核对与识读训练行为不受放行流程影响', async ({ page }) => {
     await page.goto('/');
