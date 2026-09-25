@@ -1,0 +1,29 @@
+# Docker Compose：默认只运行 web 服务。
+#
+#   docker compose up web            # 宿主端口默认 8080
+#   WEB_PORT=9090 docker compose up web
+#   docker compose run --rm verify   # 一次性验收（单元测试 + 构建 + E2E），结束即退出
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: braille-plate-web:latest
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  verify:
+    # 一次性验收服务：运行结束容器即退出，不长期驻留。
+    # 镜像 CMD：单元测试 -> 类型检查构建 -> 启动 preview -> Playwright E2E。
+    profiles: ["verify"]
+    build:
+      context: .
+      target: verify
+    image: braille-plate-verify:latest
+    environment:
+      - CI=1
+
+# verify 镜像内 Playwright 配置见 CI=1 分支：不自行启动 webServer，
+# 由容器 CMD 先以 `npm run preview` 起在 4173 端口后再执行 E2E。
