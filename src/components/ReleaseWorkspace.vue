@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import {
   createReleaseSlip,
   evaluateReleaseGate,
@@ -30,6 +30,8 @@ const { result: calibrationResult } = calibration;
 const { activeSlip, invalidatedSlip, archive } = session;
 
 const storageWarning = computed(() => archive.value.warning?.message ?? null);
+/** 跨页签覆盖被自动修复等一次性状态提示（不阻断签发）。 */
+const archiveNotice = computed(() => archive.value.notice?.message ?? null);
 const writeError = ref<string | null>(null);
 
 const gateView = computed<CalibrationGateView>(() => ({
@@ -91,13 +93,6 @@ function blockerText(blocker: ReleaseBlocker): string {
   return blocker.message;
 }
 
-// 闸门依据再次变化时，清除上一次的写入失败提示。
-watch(canRelease, () => {
-  if (writeError.value) {
-    writeError.value = null;
-  }
-});
-
 // 每次挂载重新读一次放行存档：跨标签页更新或外部损坏在进入本页时被完整恢复。
 onMounted(() => {
   session.reloadArchive();
@@ -121,8 +116,18 @@ onMounted(() => {
     role="alert"
     data-testid="release-write-error"
   >
-    <h2>放行单写入失败</h2>
+    <h2>放行单未能写入历史</h2>
     <p>{{ writeError }}</p>
+  </section>
+
+  <section
+    v-if="archiveNotice"
+    class="panel release-archive-notice"
+    role="status"
+    data-testid="release-archive-notice"
+  >
+    <h2>历史已自动补齐</h2>
+    <p>{{ archiveNotice }}</p>
   </section>
 
   <section class="panel release-authorize" aria-label="压点放行签发">

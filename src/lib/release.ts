@@ -299,8 +299,15 @@ export function createReleaseSlip(input: CreateReleaseInput, sources?: ReleaseId
 /**
  * 校验一份外部（如 localStorage 恢复）放行单的结构完整性。
  * 损坏或字段不符时返回 false，调用方只能告警并保留原记录，不得半信半疑地展示。
+ *
+ * 默认还会用领域服务重算快照（排版可由原文行宽重推、读数可重新判定合格）；
+ * 写入热路径刚写回、且旧单据已逐字节校验过时，可用 `recompute: false`
+ * 只做结构校验，避免历史越长、每次签发越慢。
  */
-export function isWellFormedSlip(value: unknown): value is ReleaseSlip {
+export function isWellFormedSlip(
+  value: unknown,
+  options: { recompute?: boolean } = { recompute: true }
+): value is ReleaseSlip {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
@@ -318,6 +325,9 @@ export function isWellFormedSlip(value: unknown): value is ReleaseSlip {
   const { draft, calibration } = snapshot as Record<string, unknown>;
   if (!isWellFormedDraft(draft) || !isWellFormedCalibration(calibration)) {
     return false;
+  }
+  if (options.recompute === false) {
+    return true;
   }
   // 最关键的一致性：快照内的排版必须能由原文与行宽重新推出，
   // 六点读数必须能重新判定出“合格”，且与逐点视图一致。

@@ -320,4 +320,73 @@ describe('ReleaseWorkspace 合格签发、失效与只读复核', () => {
     expect($('[data-testid="release-write-error"]')).toBeNull();
     mounted.unmount();
   });
+
+  it('编号冲突通过界面签发时：明确告警、历史保留原件且不出现新当前授权', async () => {
+    await preparePass('12，三。', '4');
+    const mounted = mountRelease();
+    await tick();
+    ($('[data-testid="release-issue"]') as HTMLButtonElement).click();
+    await tick();
+    expect($('[data-testid="release-active"]')).not.toBeNull();
+
+    // 模拟“下一张单据恰好拿到相同编号但内容不同”：拦截存储层追加结果为编号冲突。
+    const storageModule = await import('../../src/lib/releaseStorage');
+    const spy = vi.spyOn(storageModule, 'appendReleaseSlip').mockReturnValue({ ok: false, kind: 'id-conflict' });
+
+    sessions().draft.text.value = '99，九。';
+    await tick(2);
+    ($('[data-testid="release-issue"]') as HTMLButtonElement).click();
+    await tick(3);
+
+    expect($('[data-testid="release-write-error"]')?.textContent).toContain('编号与历史单据相同但内容不一致');
+    expect(document.querySelectorAll('[data-testid="release-history-item"]')).toHaveLength(1);
+    expect($('[data-testid="release-history-item"] [data-testid="slip-draft-text"]')?.textContent).toContain(
+      '12，三。'
+    );
+    // 冲突件没有成为当前授权
+    expect($('[data-testid="release-active"]')).toBeNull();
+
+    spy.mockRestore();
+    mounted.unmount();
+  });
+
+  it('跨页签旧整表覆盖本页签单据后自动补齐：历史含两张并显示修复提示', async () => {
+    await preparePass();
+    const mounted = mountRelease();
+    await tick();
+    ($('[data-testid="release-issue"]') as HTMLButtonElement).click();
+    await tick();
+    const mineId =
+      document.querySelector('[data-testid="release-active"] [data-testid="slip-id"]')?.textContent ?? '';
+    expect(mineId).not.toBe('');
+
+    // 另一页签签发一张，随后用“不含本页签单据”的旧整表覆盖
+    const { createReleaseSlip } = await import('../../src/lib/release');
+    const passView = {
+      verdict: 'pass' as const,
+      result: sessions().calibration.result.value!,
+      judgedRaws: sessions().calibration.judgedRaws.value,
+      currentReadings: sessions().calibration.readings.value,
+      protected: false,
+      recordVersion: 2
+    };
+    const theirs = createReleaseSlip(
+      { text: '一二三', rawWidth: '4', gate: passView },
+      { now: () => new Date(Date.UTC(2026, 8, 25)), random: () => 0.42 }
+    ).slip!;
+    window.localStorage.setItem(RELEASE_KEY, JSON.stringify({ version: 1, slips: [theirs] }));
+    window.dispatchEvent(new StorageEvent('storage', { key: RELEASE_KEY }));
+    await tick(3);
+
+    // 两张单据都在历史中，且有一次性修复提示
+    expect(document.querySelectorAll('[data-testid="release-history-item"]')).toHaveLength(2);
+    expect($('[data-testid="release-archive-notice"]')?.textContent).toContain('合并补写');
+
+    // 再触发一次存储事件不会重复提示（一次性通知已被消费）
+    window.dispatchEvent(new StorageEvent('storage', { key: RELEASE_KEY }));
+    await tick(2);
+    expect($('[data-testid="release-archive-notice"]')).toBeNull();
+    mounted.unmount();
+  });
 });
+

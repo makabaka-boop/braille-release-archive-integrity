@@ -10,7 +10,12 @@
  */
 import { effectScope, ref, watch, type Ref } from 'vue';
 import type { ReleaseSlip } from './release';
-import { appendReleaseSlip, loadReleaseState, writeFailureWarning, type StoredReleases } from './releaseStorage';
+import {
+  appendFailureWarning,
+  appendReleaseSlip,
+  loadReleaseState,
+  type StoredReleases
+} from './releaseStorage';
 import { useDraftSession } from './draftSession';
 import { useCalibrationSession } from './calibrationSession';
 
@@ -55,12 +60,13 @@ export function useReleaseSession(): ReleaseSession {
     }
 
     function issue(slip: ReleaseSlip): IssueOutcome {
-      const saved = appendReleaseSlip(slip);
-      if (!saved) {
-        reloadArchive();
-        return { ok: false, error: writeFailureWarning().message };
-      }
+      const outcome = appendReleaseSlip(slip);
+      // 无论成功失败都重新加载：成功时同步交错合并后的完整历史；
+      // 失败（配额 / 编号冲突 / 持续交错 / 保护态）时让界面看到最新真实存档。
       reloadArchive();
+      if (!outcome.ok) {
+        return { ok: false, error: appendFailureWarning(outcome.kind).message };
+      }
       invalidatedSlip.value = null;
       activeSlip.value = slip;
       return { ok: true, error: null };

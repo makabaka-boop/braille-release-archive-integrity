@@ -147,6 +147,17 @@ input[type='number'].input-invalid:focus,
   padding-left: 20px;
 }
 
+.release-archive-notice {
+  border-color: #9cc4f0;
+  background: #eef5ff;
+  color: #1d5a96;
+}
+
+.release-archive-notice h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
 .preview h2 {
   margin: 0 0 14px;
   font-size: 16px;
